@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.nixsh5.convertio",
+  "name": "Convertio",
+  "version": "1.0.0",
+  "author": "nixsh5",
+  "license": "MIT",
+  "description": "Local offline file converter powered by ffmpeg, pandoc, imagemagick, poppler, and libreoffice with GPU acceleration.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Convertio",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
