@@ -111,55 +111,84 @@ function formatDuration(sec) {
     return h + "h " + remM + "m";
 }
 
-function buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel, extraVf) {
-    var base = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats"];
+// Resolves a guaranteed non-existing output path before invoking any tool
+var UNIQUE_OUT_HELPER =
+    "unique_out() { " +
+    "  local base=\"$1\" ext=\"$2\" cand=\"${1}_converted.${2}\" n=1; " +
+    "  while [ -e \"$cand\" ]; do cand=\"${base}_converted_${n}.${ext}\"; n=$((n + 1)); done; " +
+    "  printf '%s' \"$cand\"; " +
+    "}; ";
+
+function wrapSafeCommand(basePath, dstExt, bodyScript, args) {
+    var script = UNIQUE_OUT_HELPER + "OUT=$(unique_out \"$1\" \"$2\"); " + bodyScript;
+    return ["bash", "-c", script, "bash", basePath, dstExt].concat(args);
+}
+
+function buildVideoFfmpegCmd(inputPath, basePath, dstExt, hwAccel, extraVf) {
     var isH264Container = (dstExt === "mp4" || dstExt === "mov" || dstExt === "mkv" || dstExt === "avi" || dstExt === "flv" || dstExt === "ts" || dstExt === "m4v");
 
     if (hwAccel === "nvenc" && isH264Container) {
-        var nvArgs = base.concat(["-i", inputPath]);
-        if (extraVf) nvArgs = nvArgs.concat(["-vf", extraVf]);
-        nvArgs = nvArgs.concat([
-            "-c:v", "h264_nvenc",
-            "-preset", "p4",
-            "-cq", "23",
-            "-c:a", (dstExt === "avi" ? "mp3" : "aac"),
-            "-b:a", "192k",
-            outPath
-        ]);
+        var vfPart = extraVf ? " -vf " + extraVf : "";
+        var acodec = (dstExt === "avi") ? "mp3" : "aac";
         return {
             engine: "ffmpeg",
             accel: "GPU (NVENC)",
-            outPath: outPath,
-            cmd: nvArgs
+            outPath: basePath + "_converted." + dstExt,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "ffmpeg -n -progress pipe:1 -nostats -i \"$3\"" + vfPart + " -c:v h264_nvenc -preset p4 -cq 23 -c:a " + acodec + " -b:a 192k \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
         };
     }
 
     if (hwAccel === "vaapi" && (isH264Container || dstExt === "webm")) {
         var vaCodec = dstExt === "webm" ? "vp9_vaapi" : "h264_vaapi";
         var vaFilter = extraVf ? (extraVf + ",format=nv12,hwupload") : "format=nv12,hwupload";
+        var vaAcodec = dstExt === "webm" ? "libopus" : (dstExt === "avi" ? "mp3" : "aac");
         return {
             engine: "ffmpeg",
             accel: "GPU (VAAPI)",
-            outPath: outPath,
-            cmd: base.concat([
-                "-vaapi_device", "/dev/dri/renderD128",
-                "-i", inputPath,
-                "-vf", vaFilter,
-                "-c:v", vaCodec,
-                "-c:a", dstExt === "webm" ? "libopus" : (dstExt === "avi" ? "mp3" : "aac"),
-                outPath
-            ])
+            outPath: basePath + "_converted." + dstExt,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "ffmpeg -n -progress pipe:1 -nostats -vaapi_device /dev/dri/renderD128 -i \"$3\" -vf \"" + vaFilter + "\" -c:v " + vaCodec + " -c:a " + vaAcodec + " \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
         };
     }
 
-    var cpuArgs = base.concat(["-i", inputPath]);
-    if (extraVf) cpuArgs = cpuArgs.concat(["-vf", extraVf]);
-    cpuArgs.push(outPath);
+    var cpuVfPart = extraVf ? " -vf \"" + extraVf + "\"" : "";
     return {
         engine: "ffmpeg",
         accel: "CPU",
-        outPath: outPath,
-        cmd: cpuArgs
+        outPath: basePath + "_converted." + dstExt,
+        cmd: wrapSafeCommand(
+            basePath,
+            dstExt,
+            "ffmpeg -n -progress pipe:1 -nostats -i \"$3\"" + cpuVfPart + " \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+            [inputPath]
+        )
+    };
+}
+
+function buildSofficeCmd(inputPath, basePath, dstExt, inFilter) {
+    var filterArg = inFilter ? ("--infilter=" + inFilter + " ") : "";
+    return {
+        engine: "soffice",
+        accel: "CPU",
+        outPath: basePath + "_converted." + dstExt,
+        cmd: wrapSafeCommand(
+            basePath,
+            dstExt,
+            "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
+            "soffice --headless " + filterArg + "--convert-to \"$2\" --outdir \"$TMPD\" \"$3\" >/dev/null && " +
+            "GEN=$(find \"$TMPD\" -maxdepth 1 -type f | head -n 1) && [ -n \"$GEN\" ] && " +
+            "mv -n \"$GEN\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+            [inputPath]
+        )
     };
 }
 
@@ -169,64 +198,94 @@ function buildCommand(inputPath, targetExt, hwAccel) {
     var dotIdx = inputPath.lastIndexOf(".");
     var slashIdx = inputPath.lastIndexOf("/");
     var basePath = dotIdx > slashIdx ? inputPath.substring(0, dotIdx) : inputPath;
-    var outDir = slashIdx !== -1 ? inputPath.substring(0, slashIdx) : ".";
-    var outPath = basePath + "_converted." + dstExt;
+    var defaultOutPath = basePath + "_converted." + dstExt;
 
     // 1. PDF input
     if (srcExt === "pdf") {
         if (dstExt === "txt") {
-            return { engine: "pdftotext", accel: "CPU", outPath: outPath, cmd: ["pdftotext", inputPath, outPath] };
+            return {
+                engine: "pdftotext",
+                accel: "CPU",
+                outPath: defaultOutPath,
+                cmd: wrapSafeCommand(basePath, dstExt, "pdftotext \"$3\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"", [inputPath])
+            };
         }
         if (dstExt === "md") {
             return {
                 engine: "pandoc",
                 accel: "CPU",
-                outPath: outPath,
-                cmd: ["bash", "-c", "soffice --headless --infilter=writer_pdf_import --convert-to html --outdir /tmp \"$1\" && pandoc \"/tmp/$(basename \"${1%.*}\").html\" -t gfm -o \"$2\"", "bash", inputPath, outPath]
+                outPath: defaultOutPath,
+                cmd: wrapSafeCommand(
+                    basePath,
+                    dstExt,
+                    "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
+                    "soffice --headless --infilter=writer_pdf_import --convert-to html --outdir \"$TMPD\" \"$3\" >/dev/null && " +
+                    "HTMLF=$(find \"$TMPD\" -maxdepth 1 -type f -name '*.html' | head -n 1) && [ -n \"$HTMLF\" ] && " +
+                    "pandoc --sandbox \"$HTMLF\" -t gfm -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    [inputPath]
+                )
             };
         }
         if (["png", "jpg", "webp", "tiff"].indexOf(dstExt) !== -1) {
+            var ppmFlag = (dstExt === "jpg") ? "jpeg" : dstExt;
             return {
                 engine: "pdftoppm",
                 accel: "CPU",
-                outPath: outPath,
-                cmd: ["bash", "-c", "if command -v pdftoppm >/dev/null 2>&1; then pdftoppm -" + (dstExt === "jpg" ? "jpeg" : dstExt) + " -r 150 -singlefile \"$1\" \"${2%.*}\" 2>/dev/null || magick -density 150 \"$1\" \"$2\"; else magick -density 150 \"$1\" \"$2\"; fi", "bash", inputPath, outPath]
+                outPath: defaultOutPath,
+                cmd: wrapSafeCommand(
+                    basePath,
+                    dstExt,
+                    "if command -v pdftoppm >/dev/null 2>&1; then " +
+                    "  pdftoppm -" + ppmFlag + " -r 150 -singlefile \"$3\" \"${OUT%.*}\" 2>/dev/null || magick -density 150 \"$3\" \"$OUT\"; " +
+                    "else magick -density 150 \"$3\" \"$OUT\"; fi && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    [inputPath]
+                )
             };
         }
-        return {
-            engine: "soffice",
-            accel: "CPU",
-            outPath: basePath + "." + dstExt,
-            cmd: ["soffice", "--headless", "--infilter=writer_pdf_import", "--convert-to", dstExt, "--outdir", outDir, inputPath]
-        };
+        return buildSofficeCmd(inputPath, basePath, dstExt, "writer_pdf_import");
     }
 
     // 2. GIF -> Video or Still Image
     if (srcExt === "gif") {
         if (VIDEO_EXTS.indexOf(dstExt) !== -1) {
-            return buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel || "cpu", "scale=trunc(iw/2)*2:trunc(ih/2)*2,pix_fmt=yuv420p");
+            return buildVideoFfmpegCmd(inputPath, basePath, dstExt, hwAccel || "cpu", "scale=trunc(iw/2)*2:trunc(ih/2)*2,pix_fmt=yuv420p");
         }
-        return { engine: "magick", accel: "CPU", outPath: outPath, cmd: ["magick", inputPath + "[0]", outPath] };
+        return {
+            engine: "magick",
+            accel: "CPU",
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(basePath, dstExt, "magick \"${3}[0]\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"", [inputPath])
+        };
     }
 
     // 3. Video -> Video / Audio / GIF
     if (VIDEO_EXTS.indexOf(srcExt) !== -1) {
         if (VIDEO_EXTS.indexOf(dstExt) !== -1) {
-            return buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel || "cpu", null);
+            return buildVideoFfmpegCmd(inputPath, basePath, dstExt, hwAccel || "cpu", null);
         }
         if (dstExt === "gif") {
             return {
                 engine: "ffmpeg",
                 accel: "CPU",
-                outPath: outPath,
-                cmd: ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-i", inputPath, "-vf", "fps=15,scale=640:-1:flags=lanczos", outPath]
+                outPath: defaultOutPath,
+                cmd: wrapSafeCommand(
+                    basePath,
+                    dstExt,
+                    "ffmpeg -n -progress pipe:1 -nostats -i \"$3\" -vf \"fps=15,scale=640:-1:flags=lanczos\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    [inputPath]
+                )
             };
         }
         return {
             engine: "ffmpeg",
             accel: "CPU",
-            outPath: outPath,
-            cmd: ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-i", inputPath, "-vn", outPath]
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "ffmpeg -n -progress pipe:1 -nostats -i \"$3\" -vn \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
         };
     }
 
@@ -235,45 +294,61 @@ function buildCommand(inputPath, targetExt, hwAccel) {
         return {
             engine: "ffmpeg",
             accel: "CPU",
-            outPath: outPath,
-            cmd: ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-i", inputPath, outPath]
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "ffmpeg -n -progress pipe:1 -nostats -i \"$3\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
         };
     }
 
     // 5. Images -> ImageMagick
     if (IMAGE_EXTS.indexOf(srcExt) !== -1) {
-        return { engine: "magick", accel: "CPU", outPath: outPath, cmd: ["magick", inputPath, outPath] };
+        return {
+            engine: "magick",
+            accel: "CPU",
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(basePath, dstExt, "magick \"$3\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"", [inputPath])
+        };
     }
 
     // 6. Office formats
     if (OFFICE_EXTS.indexOf(srcExt) !== -1) {
         if ((srcExt === "docx" || srcExt === "odt") && (dstExt === "md" || dstExt === "html" || dstExt === "txt" || dstExt === "epub" || dstExt === "rst")) {
             var pandocFmt = (dstExt === "txt") ? "plain" : ((dstExt === "md") ? "gfm" : dstExt);
-            return { engine: "pandoc", accel: "CPU", outPath: outPath, cmd: ["pandoc", inputPath, "-t", pandocFmt, "-o", outPath] };
+            return {
+                engine: "pandoc",
+                accel: "CPU",
+                outPath: defaultOutPath,
+                cmd: wrapSafeCommand(
+                    basePath,
+                    dstExt,
+                    "pandoc --sandbox \"$3\" -t " + pandocFmt + " -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    [inputPath]
+                )
+            };
         }
-        return {
-            engine: "soffice",
-            accel: "CPU",
-            outPath: basePath + "." + dstExt,
-            cmd: ["soffice", "--headless", "--convert-to", dstExt, "--outdir", outDir, inputPath]
-        };
+        return buildSofficeCmd(inputPath, basePath, dstExt, null);
     }
 
     // 7. Plain Text (.txt) input
     if (srcExt === "txt") {
         if (dstExt === "pdf" || dstExt === "docx" || dstExt === "odt") {
-            return {
-                engine: "soffice",
-                accel: "CPU",
-                outPath: basePath + "." + dstExt,
-                cmd: ["soffice", "--headless", "--convert-to", dstExt, "--outdir", outDir, inputPath]
-            };
+            return buildSofficeCmd(inputPath, basePath, dstExt, null);
         }
+        var txtTargetFmt = (dstExt === "md") ? "gfm" : dstExt;
         return {
             engine: "pandoc",
             accel: "CPU",
-            outPath: outPath,
-            cmd: ["pandoc", "-f", "markdown", inputPath, "-t", dstExt === "md" ? "gfm" : dstExt, "-o", outPath]
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "pandoc --sandbox -f markdown \"$3\" -t " + txtTargetFmt + " -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
         };
     }
 
@@ -282,16 +357,44 @@ function buildCommand(inputPath, targetExt, hwAccel) {
         return {
             engine: "pandoc",
             accel: "CPU",
-            outPath: outPath,
-            cmd: [
-                "bash", "-c",
-                "pandoc \"$1\" -o \"$2\" 2>/dev/null || (pandoc \"$1\" -o /tmp/omarchy_doc_tmp.html && soffice --headless --convert-to pdf --outdir /tmp /tmp/omarchy_doc_tmp.html && mv /tmp/omarchy_doc_tmp.pdf \"$2\")",
-                "bash", inputPath, outPath
-            ]
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
+                "if pandoc --sandbox \"$3\" -o \"$TMPD/out.pdf\" 2>/dev/null; then " +
+                "  mv -n \"$TMPD/out.pdf\" \"$OUT\"; " +
+                "else " +
+                "  pandoc --sandbox \"$3\" -o \"$TMPD/doc.html\" && " +
+                "  soffice --headless --convert-to pdf --outdir \"$TMPD\" \"$TMPD/doc.html\" >/dev/null && " +
+                "  mv -n \"$TMPD/doc.pdf\" \"$OUT\"; " +
+                "fi && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
         };
     }
     if (dstExt === "txt") {
-        return { engine: "pandoc", accel: "CPU", outPath: outPath, cmd: ["pandoc", inputPath, "-t", "plain", "-o", outPath] };
+        return {
+            engine: "pandoc",
+            accel: "CPU",
+            outPath: defaultOutPath,
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "pandoc --sandbox \"$3\" -t plain -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                [inputPath]
+            )
+        };
     }
-    return { engine: "pandoc", accel: "CPU", outPath: outPath, cmd: ["pandoc", inputPath, "-o", outPath] };
+    return {
+        engine: "pandoc",
+        accel: "CPU",
+        outPath: defaultOutPath,
+        cmd: wrapSafeCommand(
+            basePath,
+            dstExt,
+            "pandoc --sandbox \"$3\" -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+            [inputPath]
+        )
+    };
 }

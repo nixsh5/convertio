@@ -148,13 +148,21 @@ Panel {
         progressRatio = 0.04
         statusLine = "CONVERTING · ~" + Conv.formatDuration(etaRemainingSec).toUpperCase() + " LEFT"
 
+        // Snapshot job inputs so changing selection mid-run never deletes the wrong source
+        convertProc.jobSourcePath = selectedFile
+        convertProc.jobKeepOriginal = keepOriginal
         convertProc.outPath = plan.outPath
         convertProc.command = plan.cmd
         convertProc.running = true
     }
 
-    function handleFfmpegProgressLine(line) {
+    function handleProcessStdoutLine(line) {
         var trimmed = line.trim()
+        if (trimmed.indexOf("__OUT_PATH__=") === 0) {
+            var resolved = trimmed.substring(13)
+            if (resolved !== "") convertProc.outPath = resolved
+            return
+        }
         if (trimmed.indexOf("out_time_us=") === 0) {
             var us = parseFloat(trimmed.substring(12))
             if (!isNaN(us) && us > 0 && mediaDurationSec > 0) {
@@ -324,9 +332,11 @@ Panel {
 
     Process {
         id: convertProc
+        property string jobSourcePath: ""
+        property bool jobKeepOriginal: true
         property string outPath: ""
         stdout: SplitParser {
-            onRead: function(line) { root.handleFfmpegProgressLine(line) }
+            onRead: function(line) { root.handleProcessStdoutLine(line) }
         }
         stderr: StdioCollector {
             id: errCollector
@@ -339,8 +349,8 @@ Panel {
                 root.progressRatio = 1.0
                 root.lastOutputPath = outPath
                 root.statusLine = "DONE IN " + totalTook + "S"
-                if (!root.keepOriginal && root.selectedFile !== outPath) {
-                    Util.execArgv(["rm", "-f", root.selectedFile])
+                if (!jobKeepOriginal && jobSourcePath !== "" && jobSourcePath !== outPath) {
+                    Util.execArgv(["rm", "-f", jobSourcePath])
                 }
             } else {
                 root.progressRatio = 0
@@ -517,7 +527,7 @@ Panel {
                     }
                 }
 
-                // Missing Dependencies Banner (only visible if any backend package is missing)
+                // Missing Dependencies Banner
                 Rectangle {
                     visible: root.missingPackagesList !== ""
                     Layout.fillWidth: true
