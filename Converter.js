@@ -75,6 +75,18 @@ function normalizePath(raw) {
     return p;
 }
 
+function getPackageForEngine(engine) {
+    var map = {
+        "ffmpeg":    "ffmpeg",
+        "magick":    "imagemagick",
+        "pandoc":    "pandoc",
+        "soffice":   "libreoffice-fresh",
+        "pdftotext": "poppler",
+        "pdftoppm":  "poppler"
+    };
+    return map[engine] || engine;
+}
+
 function estimateInitialSeconds(engine, fileBytes, mediaDurationSec, accelMode) {
     var mb = Math.max(0.1, fileBytes / (1024 * 1024));
     if (engine === "ffmpeg") {
@@ -103,7 +115,6 @@ function buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel, extraVf) {
     var base = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats"];
     var isH264Container = (dstExt === "mp4" || dstExt === "mov" || dstExt === "mkv" || dstExt === "avi" || dstExt === "flv" || dstExt === "ts" || dstExt === "m4v");
 
-    // NVIDIA RTX NVENC
     if (hwAccel === "nvenc" && isH264Container) {
         var nvArgs = base.concat(["-i", inputPath]);
         if (extraVf) nvArgs = nvArgs.concat(["-vf", extraVf]);
@@ -123,7 +134,6 @@ function buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel, extraVf) {
         };
     }
 
-    // AMD / Intel VA-API
     if (hwAccel === "vaapi" && (isH264Container || dstExt === "webm")) {
         var vaCodec = dstExt === "webm" ? "vp9_vaapi" : "h264_vaapi";
         var vaFilter = extraVf ? (extraVf + ",format=nv12,hwupload") : "format=nv12,hwupload";
@@ -142,7 +152,6 @@ function buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel, extraVf) {
         };
     }
 
-    // CPU fallback
     var cpuArgs = base.concat(["-i", inputPath]);
     if (extraVf) cpuArgs = cpuArgs.concat(["-vf", extraVf]);
     cpuArgs.push(outPath);
@@ -169,8 +178,6 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             return { engine: "pdftotext", accel: "CPU", outPath: outPath, cmd: ["pdftotext", inputPath, outPath] };
         }
         if (dstExt === "md") {
-            // Convert PDF -> HTML via soffice, then HTML -> Markdown via pandoc
-            var tmpHtml = "/tmp/omarchy_pdf_conv.html";
             return {
                 engine: "pandoc",
                 accel: "CPU",
@@ -194,10 +201,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
         };
     }
 
-    // 2. GIF -> Video (now obeys GPU toggle!) or Still Image
+    // 2. GIF -> Video or Still Image
     if (srcExt === "gif") {
         if (VIDEO_EXTS.indexOf(dstExt) !== -1) {
-            // Scale to even dimensions (pad/scale) so NVENC/VAAPI/x264 never reject odd-sized GIFs
             return buildVideoFfmpegCmd(inputPath, outPath, dstExt, hwAccel || "cpu", "scale=trunc(iw/2)*2:trunc(ih/2)*2,pix_fmt=yuv420p");
         }
         return { engine: "magick", accel: "CPU", outPath: outPath, cmd: ["magick", inputPath + "[0]", outPath] };
@@ -253,7 +259,7 @@ function buildCommand(inputPath, targetExt, hwAccel) {
         };
     }
 
-    // 7. Plain Text (.txt) input (Pandoc does NOT accept -f txt; use markdown/soffice)
+    // 7. Plain Text (.txt) input
     if (srcExt === "txt") {
         if (dstExt === "pdf" || dstExt === "docx" || dstExt === "odt") {
             return {
@@ -273,7 +279,6 @@ function buildCommand(inputPath, targetExt, hwAccel) {
 
     // 8. Markup & Documents (md, html, tex, epub, rst)
     if (dstExt === "pdf") {
-        // Use pandoc if pdflatex/weasyprint exists, otherwise fall back to soffice
         return {
             engine: "pandoc",
             accel: "CPU",

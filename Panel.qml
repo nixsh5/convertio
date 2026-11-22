@@ -49,10 +49,19 @@ Panel {
     property string statusLine: "DROP OR PICK A FILE"
     property string lastOutputPath: ""
 
+    // Engine installation state
+    property var installedEngines: ({})
+    property string missingPackagesList: ""
+    property bool installingDeps: false
+    readonly property bool engineReady: !plan || installedEngines[plan.engine] === true
+    readonly property string missingPackage: plan ? Conv.getPackageForEngine(plan.engine) : ""
+
+    // GPU Hardware Acceleration state
     property string detectedHwAccel: "cpu"
     property bool useGpu: true
     readonly property string activeHwAccel: useGpu ? detectedHwAccel : "cpu"
 
+    // Live ETA & Progress tracking
     property double startTimeMs: 0
     property real elapsedSec: 0
     property real estimatedTotalSec: 0
@@ -75,6 +84,27 @@ Panel {
             return "~" + Conv.formatDuration(Conv.estimateInitialSeconds(plan.engine, fileBytes, mediaDurationSec, activeHwAccel))
         }
         return "--"
+    }
+
+    function probeEngines() {
+        if (!engineProbeProc.running) engineProbeProc.running = true
+    }
+
+    function installPackages(pkgString) {
+        if (pkgString === "" || installingDeps) return
+        installingDeps = true
+        statusLine = "INSTALLING DEPENDENCIES..."
+        var cmdStr = "sudo pacman -S --needed " + pkgString + "; echo; read -p 'Finished. Press Enter to close...'"
+        installProc.command = [
+            "bash", "-c",
+            "if command -v xdg-terminal-exec >/dev/null 2>&1; then xdg-terminal-exec bash -c \"$1\"; " +
+            "elif command -v alacritty >/dev/null 2>&1; then alacritty -e bash -c \"$1\"; " +
+            "elif command -v ghostty >/dev/null 2>&1; then ghostty -e bash -c \"$1\"; " +
+            "elif command -v kitty >/dev/null 2>&1; then kitty bash -c \"$1\"; " +
+            "else exit 127; fi",
+            "bash", cmdStr
+        ]
+        installProc.running = true
     }
 
     function loadFile(rawPath) {
@@ -108,7 +138,7 @@ Panel {
     }
 
     function runConversion() {
-        if (!plan || converting) return
+        if (!plan || converting || !engineReady) return
         converting = true
         startTimeMs = Date.now()
         elapsedSec = 0
@@ -145,8 +175,62 @@ Panel {
         }
     }
 
-    Component.onCompleted: gpuProbeProc.running = true
+    Component.onCompleted: {
+        gpuProbeProc.running = true
+        probeEngines()
+    }
 
+    onOpenedChanged: {
+        if (opened) probeEngines()
+    }
+
+    // Probe installed CLI engines and missing Arch packages
+    Process {
+        id: engineProbeProc
+        command: [
+            "bash", "-c",
+            "for pair in ffmpeg:ffmpeg magick:imagemagick pandoc:pandoc soffice:libreoffice-fresh pdftotext:poppler pdftoppm:poppler zenity:zenity wl-paste:wl-clipboard; do " +
+            "  cmd=${pair%%:*}; pkg=${pair#*:}; " +
+            "  if command -v $cmd >/dev/null 2>&1; then echo \"$cmd:1:\"; else echo \"$cmd:0:$pkg\"; fi; " +
+            "done"
+        ]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var map = {}
+                var missing = []
+                var lines = text.trim().split("\n")
+                for (var i = 0; i < lines.length; i++) {
+                    var parts = lines[i].split(":")
+                    if (parts.length >= 2) {
+                        var ok = (parts[1] === "1")
+                        map[parts[0]] = ok
+                        if (!ok && parts.length === 3 && parts[2] !== "" && missing.indexOf(parts[2]) === -1) {
+                            missing.push(parts[2])
+                        }
+                    }
+                }
+                root.installedEngines = map
+                root.missingPackagesList = missing.join(" ")
+            }
+        }
+    }
+
+    // Terminal package installer
+    Process {
+        id: installProc
+        onExited: function(exitCode) {
+            root.installingDeps = false
+            root.probeEngines()
+            gpuProbeProc.running = true
+            if (exitCode === 0) {
+                root.statusLine = root.selectedFile !== "" ? "READY TO CONVERT" : "DEPENDENCIES INSTALLED"
+            } else {
+                root.statusLine = "NO TERMINAL FOUND FOR INSTALL"
+            }
+        }
+    }
+
+    // Probe working GPU hardware encoder
     Process {
         id: gpuProbeProc
         command: [
@@ -347,7 +431,7 @@ Panel {
 
                         Text {
                             text: root.statusLine
-                            color: root.converting ? Commons.Color.accent : root.dim
+                            color: (root.converting || root.installingDeps) ? Commons.Color.accent : root.dim
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                             font.letterSpacing: 1.2
@@ -433,6 +517,57 @@ Panel {
                     }
                 }
 
+                // Missing Dependencies Banner (only visible if any backend package is missing)
+                Rectangle {
+                    visible: root.missingPackagesList !== ""
+                    Layout.fillWidth: true
+                    height: Style.space(34)
+                    radius: Style.cornerRadius
+                    color: depBannerArea.containsMouse ? root.cardFill : "transparent"
+                    border.color: Commons.Color.accent
+                    border.width: 1
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Style.space(10)
+                        anchors.rightMargin: Style.space(10)
+                        spacing: Style.space(8)
+
+                        Text {
+                            text: "󰏗"
+                            color: Commons.Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Missing: " + root.missingPackagesList
+                            color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            text: root.installingDeps ? "INSTALLING..." : "INSTALL ALL"
+                            color: Commons.Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.letterSpacing: 1.0
+                        }
+                    }
+
+                    MouseArea {
+                        id: depBannerArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: !root.installingDeps
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.installPackages(root.missingPackagesList)
+                    }
+                }
+
                 // 2x4 Metadata Grid
                 GridLayout {
                     Layout.fillWidth: true
@@ -448,7 +583,14 @@ Panel {
                     Text { text: "Size"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                     Text { text: root.fileSizeText; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
                     Text { text: "Engine"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                    Text { text: root.plan ? root.plan.engine : "--"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
+                    Text {
+                        text: root.plan ? (root.plan.engine + (root.engineReady ? "" : " (missing)")) : "--"
+                        color: (root.plan && !root.engineReady) ? Commons.Color.accent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        Layout.alignment: Qt.AlignRight
+                        Layout.fillWidth: true
+                    }
 
                     Text { text: "Compute"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                     Text {
@@ -534,7 +676,7 @@ Panel {
                     }
                 }
 
-                // Actions + Live Progress Bar
+                // Actions + Live Progress Bar / One-Click Engine Installer
                 ColumnLayout {
                     Layout.fillWidth: true
                     spacing: Style.space(6)
@@ -552,7 +694,7 @@ Panel {
                         height: Style.space(48)
                         radius: Style.cornerRadius
                         color: root.plan ? root.cardFill : "transparent"
-                        border.color: root.converting ? Commons.Color.accent : root.borderColor
+                        border.color: (root.converting || (root.plan && !root.engineReady)) ? Commons.Color.accent : root.borderColor
                         border.width: 1
                         opacity: root.plan ? 1.0 : 0.5
                         clip: true
@@ -574,8 +716,8 @@ Panel {
                             spacing: Style.space(10)
 
                             Text {
-                                text: root.converting ? "󰔟" : "󰑐"
-                                color: root.converting ? Commons.Color.accent : root.foreground
+                                text: root.converting ? "󰔟" : ((root.plan && !root.engineReady) ? "󰏗" : "󰑐")
+                                color: (root.converting || (root.plan && !root.engineReady)) ? Commons.Color.accent : root.foreground
                                 font.family: root.fontFamily
                                 font.pixelSize: Style.font.subtitle
                             }
@@ -585,9 +727,12 @@ Panel {
                                 spacing: 1
 
                                 Text {
-                                    text: root.converting
-                                        ? ("Converting to " + root.targetFormat + " (" + root.etaDisplayText + ")")
-                                        : (root.plan ? ("Convert to " + root.targetFormat) : "Drop or pick a file first")
+                                    text: {
+                                        if (root.converting) return "Converting to " + root.targetFormat + " (" + root.etaDisplayText + ")"
+                                        if (!root.plan) return "Drop or pick a file first"
+                                        if (!root.engineReady) return "Install " + root.missingPackage + " to convert"
+                                        return "Convert to " + root.targetFormat
+                                    }
                                     color: root.foreground
                                     font.family: root.fontFamily
                                     font.pixelSize: Style.font.bodySmall
@@ -595,9 +740,12 @@ Panel {
                                 }
 
                                 Text {
-                                    text: root.converting
-                                        ? ("Elapsed: " + Conv.formatDuration(root.elapsedSec) + " · " + (root.plan ? root.plan.accel : ""))
-                                        : (root.plan ? ("Est. " + root.etaDisplayText + " via " + root.plan.engine + " (" + root.plan.accel + ")") : "Drag onto panel, click folder, or paste")
+                                    text: {
+                                        if (root.converting) return "Elapsed: " + Conv.formatDuration(root.elapsedSec) + " · " + root.plan.accel
+                                        if (!root.plan) return "Drag onto panel, click folder, or paste"
+                                        if (!root.engineReady) return "Click to install via pacman in terminal"
+                                        return "Est. " + root.etaDisplayText + " via " + root.plan.engine + " (" + root.plan.accel + ")"
+                                    }
                                     color: root.dim
                                     font.family: root.fontFamily
                                     font.pixelSize: Style.font.caption
@@ -606,7 +754,7 @@ Panel {
 
                             Text {
                                 text: root.converting ? (Math.round(root.progressRatio * 100) + "%") : "󰁔"
-                                color: root.converting ? Commons.Color.accent : root.foreground
+                                color: (root.converting || (root.plan && !root.engineReady)) ? Commons.Color.accent : root.foreground
                                 font.family: root.fontFamily
                                 font.pixelSize: Style.font.bodySmall
                             }
@@ -614,9 +762,12 @@ Panel {
 
                         MouseArea {
                             anchors.fill: parent
-                            enabled: root.plan !== null && !root.converting
+                            enabled: root.plan !== null && !root.converting && !root.installingDeps
                             cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: root.runConversion()
+                            onClicked: {
+                                if (!root.engineReady) root.installPackages(root.missingPackage)
+                                else root.runConversion()
+                            }
                         }
                     }
 
