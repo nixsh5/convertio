@@ -111,8 +111,8 @@ function formatDuration(sec) {
     return h + "h " + remM + "m";
 }
 
-// Checks both .tif and .tiff when target is TIFF so Poppler's .tif never collides,
-// and provides atomic_save() via hardlink (ln) + unlink so concurrent saves never overwrite or silently skip.
+// Stages all conversions in a private directory on the SAME filesystem as the destination,
+// then publishes via kernel-atomic hardlink (ln) with retry loop—never mv, never EXDEV, never overwrites.
 var SAFE_IO_HELPERS =
     "stem_free() { " +
     "  local stem=\"$1\" ext=\"$2\"; " +
@@ -123,23 +123,31 @@ var SAFE_IO_HELPERS =
     "  fi; " +
     "  return 0; " +
     "}; " +
-    "unique_out() { " +
-    "  local base=\"$1\" ext=\"$2\" stem=\"${1}_converted\" n=1; " +
-    "  while ! stem_free \"$stem\" \"$ext\"; do stem=\"${base}_converted_${n}\"; n=$((n + 1)); done; " +
-    "  printf '%s.%s' \"$stem\" \"$ext\"; " +
-    "}; " +
     "atomic_save() { " +
-    "  local src=\"$1\" base=\"$2\" ext=\"$3\" cand; " +
+    "  local src=\"$1\" base=\"$2\" ext=\"$3\" stem=\"${2}_converted\" n=1 cand; " +
     "  [ -s \"$src\" ] || return 1; " +
     "  while :; do " +
-    "    cand=$(unique_out \"$base\" \"$ext\"); " +
-    "    if ln \"$src\" \"$cand\" 2>/dev/null; then rm -f \"$src\"; printf '%s' \"$cand\"; return 0; fi; " +
-    "    [ -e \"$cand\" ] || { mv -- \"$src\" \"$cand\" && printf '%s' \"$cand\" && return 0; return 1; }; " +
+    "    while ! stem_free \"$stem\" \"$ext\"; do stem=\"${base}_converted_${n}\"; n=$((n + 1)); done; " +
+    "    cand=\"${stem}.${ext}\"; " +
+    "    if ln -- \"$src\" \"$cand\" 2>/dev/null; then " +
+    "      rm -f -- \"$src\"; " +
+    "      printf '%s' \"$cand\"; " +
+    "      return 0; " +
+    "    fi; " +
+    "    if [ ! -e \"$cand\" ]; then return 1; fi; " +
+    "    stem=\"${base}_converted_${n}\"; " +
+    "    n=$((n + 1)); " +
     "  done; " +
     "}; ";
 
 function wrapSafeCommand(basePath, dstExt, bodyScript, args) {
-    var script = SAFE_IO_HELPERS + "OUT=$(unique_out \"$1\" \"$2\"); " + bodyScript;
+    var script =
+        SAFE_IO_HELPERS +
+        "BASE=\"$1\"; EXT=\"$2\"; " +
+        "OUTDIR=$(dirname -- \"$BASE\"); " +
+        "TMPD=$(mktemp -d -- \"${OUTDIR}/.convertio_tmp.XXXXXX\") || exit 1; " +
+        "trap 'rm -rf -- \"$TMPD\"' EXIT; " +
+        bodyScript;
     return ["bash", "-c", script, "bash", basePath, dstExt].concat(args);
 }
 
@@ -156,7 +164,9 @@ function buildVideoFfmpegCmd(inputPath, basePath, dstExt, hwAccel, extraVf) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "ffmpeg -n -progress pipe:1 -nostats -i \"$3\"" + vfPart + " -c:v h264_nvenc -preset p4 -cq 23 -c:a " + acodec + " -b:a 192k \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "ffmpeg -y -progress pipe:1 -nostats -i \"$3\"" + vfPart + " -c:v h264_nvenc -preset p4 -cq 23 -c:a " + acodec + " -b:a 192k \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };
@@ -173,7 +183,9 @@ function buildVideoFfmpegCmd(inputPath, basePath, dstExt, hwAccel, extraVf) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "ffmpeg -n -progress pipe:1 -nostats -vaapi_device /dev/dri/renderD128 -i \"$3\" -vf \"" + vaFilter + "\" -c:v " + vaCodec + " -c:a " + vaAcodec + " \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "ffmpeg -y -progress pipe:1 -nostats -vaapi_device /dev/dri/renderD128 -i \"$3\" -vf \"" + vaFilter + "\" -c:v " + vaCodec + " -c:a " + vaAcodec + " \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };
@@ -187,7 +199,9 @@ function buildVideoFfmpegCmd(inputPath, basePath, dstExt, hwAccel, extraVf) {
         cmd: wrapSafeCommand(
             basePath,
             dstExt,
-            "ffmpeg -n -progress pipe:1 -nostats -i \"$3\"" + cpuVfPart + " \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+            "STAGE=\"$TMPD/out.$EXT\"; " +
+            "ffmpeg -y -progress pipe:1 -nostats -i \"$3\"" + cpuVfPart + " \"$STAGE\" && " +
+            "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
             [inputPath]
         )
     };
@@ -202,10 +216,9 @@ function buildSofficeCmd(inputPath, basePath, dstExt, inFilter) {
         cmd: wrapSafeCommand(
             basePath,
             dstExt,
-            "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
-            "soffice --headless " + filterArg + "--convert-to \"$2\" --outdir \"$TMPD\" \"$3\" >/dev/null && " +
+            "soffice --headless " + filterArg + "--convert-to \"$EXT\" --outdir \"$TMPD\" -- \"$3\" >/dev/null && " +
             "GEN=$(find \"$TMPD\" -maxdepth 1 -type f | head -n 1) && [ -n \"$GEN\" ] && " +
-            "FINAL=$(atomic_save \"$GEN\" \"$1\" \"$2\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
+            "FINAL=$(atomic_save \"$GEN\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
             [inputPath]
         )
     };
@@ -226,7 +239,14 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                 engine: "pdftotext",
                 accel: "CPU",
                 outPath: defaultOutPath,
-                cmd: wrapSafeCommand(basePath, dstExt, "pdftotext \"$3\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"", [inputPath])
+                cmd: wrapSafeCommand(
+                    basePath,
+                    dstExt,
+                    "STAGE=\"$TMPD/out.$EXT\"; " +
+                    "pdftotext -- \"$3\" \"$STAGE\" && " +
+                    "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
+                    [inputPath]
+                )
             };
         }
         if (dstExt === "md") {
@@ -237,17 +257,15 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                 cmd: wrapSafeCommand(
                     basePath,
                     dstExt,
-                    "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
-                    "soffice --headless --infilter=writer_pdf_import --convert-to html --outdir \"$TMPD\" \"$3\" >/dev/null && " +
+                    "soffice --headless --infilter=writer_pdf_import --convert-to html --outdir \"$TMPD\" -- \"$3\" >/dev/null && " +
                     "HTMLF=$(find \"$TMPD\" -maxdepth 1 -type f -name '*.html' | head -n 1) && [ -n \"$HTMLF\" ] && " +
                     "pandoc --sandbox \"$HTMLF\" -t gfm -o \"$TMPD/out.md\" && " +
-                    "FINAL=$(atomic_save \"$TMPD/out.md\" \"$1\" \"$2\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
+                    "FINAL=$(atomic_save \"$TMPD/out.md\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                     [inputPath]
                 )
             };
         }
         if (["png", "jpg", "webp", "tiff"].indexOf(dstExt) !== -1) {
-            // pdftoppm -tiff writes <stem>.tif; canonicalize effective extension to "tif"
             var effectiveImgExt = (dstExt === "tiff") ? "tif" : dstExt;
             var ppmFlag = (dstExt === "jpg") ? "jpeg" : dstExt;
             return {
@@ -257,8 +275,10 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                 cmd: wrapSafeCommand(
                     basePath,
                     effectiveImgExt,
-                    "if command -v pdftoppm >/dev/null 2>&1 && pdftoppm -" + ppmFlag + " -r 150 -singlefile \"$3\" \"${OUT%.*}\" 2>/dev/null; then :; " +
-                    "else magick -density 150 \"$3\" \"$OUT\"; fi && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    "STAGE=\"$TMPD/out.$EXT\"; " +
+                    "if command -v pdftoppm >/dev/null 2>&1 && pdftoppm -" + ppmFlag + " -r 150 -singlefile -- \"$3\" \"$TMPD/out\" 2>/dev/null; then :; " +
+                    "else magick -density 150 \"$3\" \"$STAGE\"; fi && " +
+                    "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                     [inputPath]
                 )
             };
@@ -275,7 +295,14 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             engine: "magick",
             accel: "CPU",
             outPath: defaultOutPath,
-            cmd: wrapSafeCommand(basePath, dstExt, "magick \"${3}[0]\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"", [inputPath])
+            cmd: wrapSafeCommand(
+                basePath,
+                dstExt,
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "magick \"${3}[0]\" \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
+                [inputPath]
+            )
         };
     }
 
@@ -292,7 +319,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                 cmd: wrapSafeCommand(
                     basePath,
                     dstExt,
-                    "ffmpeg -n -progress pipe:1 -nostats -i \"$3\" -vf \"fps=15,scale=640:-1:flags=lanczos\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    "STAGE=\"$TMPD/out.$EXT\"; " +
+                    "ffmpeg -y -progress pipe:1 -nostats -i \"$3\" -vf \"fps=15,scale=640:-1:flags=lanczos\" \"$STAGE\" && " +
+                    "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                     [inputPath]
                 )
             };
@@ -304,7 +333,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "ffmpeg -n -progress pipe:1 -nostats -i \"$3\" -vn \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "ffmpeg -y -progress pipe:1 -nostats -i \"$3\" -vn \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };
@@ -319,7 +350,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "ffmpeg -n -progress pipe:1 -nostats -i \"$3\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "ffmpeg -y -progress pipe:1 -nostats -i \"$3\" \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };
@@ -327,11 +360,19 @@ function buildCommand(inputPath, targetExt, hwAccel) {
 
     // 5. Images -> ImageMagick
     if (IMAGE_EXTS.indexOf(srcExt) !== -1) {
+        var effectiveImgDst = (dstExt === "tiff") ? "tif" : dstExt;
         return {
             engine: "magick",
             accel: "CPU",
-            outPath: defaultOutPath,
-            cmd: wrapSafeCommand(basePath, dstExt, "magick \"$3\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"", [inputPath])
+            outPath: basePath + "_converted." + effectiveImgDst,
+            cmd: wrapSafeCommand(
+                basePath,
+                effectiveImgDst,
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "magick \"$3\" \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
+                [inputPath]
+            )
         };
     }
 
@@ -346,7 +387,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                 cmd: wrapSafeCommand(
                     basePath,
                     dstExt,
-                    "pandoc --sandbox \"$3\" -t " + pandocFmt + " -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    "STAGE=\"$TMPD/out.$EXT\"; " +
+                    "pandoc --sandbox \"$3\" -t " + pandocFmt + " -o \"$STAGE\" && " +
+                    "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                     [inputPath]
                 )
             };
@@ -367,7 +410,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "pandoc --sandbox -f markdown \"$3\" -t " + txtTargetFmt + " -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "pandoc --sandbox -f markdown \"$3\" -t " + txtTargetFmt + " -o \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };
@@ -382,13 +427,12 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
                 "if pandoc --sandbox \"$3\" -o \"$TMPD/out.pdf\" 2>/dev/null; then " +
-                "  FINAL=$(atomic_save \"$TMPD/out.pdf\" \"$1\" \"$2\"); " +
+                "  FINAL=$(atomic_save \"$TMPD/out.pdf\" \"$BASE\" \"$EXT\"); " +
                 "else " +
                 "  pandoc --sandbox \"$3\" -o \"$TMPD/doc.html\" && " +
-                "  soffice --headless --convert-to pdf --outdir \"$TMPD\" \"$TMPD/doc.html\" >/dev/null && " +
-                "  FINAL=$(atomic_save \"$TMPD/doc.pdf\" \"$1\" \"$2\"); " +
+                "  soffice --headless --convert-to pdf --outdir \"$TMPD\" -- \"$TMPD/doc.html\" >/dev/null && " +
+                "  FINAL=$(atomic_save \"$TMPD/doc.pdf\" \"$BASE\" \"$EXT\"); " +
                 "fi && [ -n \"$FINAL\" ] && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
@@ -402,7 +446,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
             cmd: wrapSafeCommand(
                 basePath,
                 dstExt,
-                "pandoc --sandbox \"$3\" -t plain -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "STAGE=\"$TMPD/out.$EXT\"; " +
+                "pandoc --sandbox \"$3\" -t plain -o \"$STAGE\" && " +
+                "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };
@@ -414,7 +460,9 @@ function buildCommand(inputPath, targetExt, hwAccel) {
         cmd: wrapSafeCommand(
             basePath,
             dstExt,
-            "pandoc --sandbox \"$3\" -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+            "STAGE=\"$TMPD/out.$EXT\"; " +
+            "pandoc --sandbox \"$3\" -o \"$STAGE\" && " +
+            "FINAL=$(atomic_save \"$STAGE\" \"$BASE\" \"$EXT\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
             [inputPath]
         )
     };
