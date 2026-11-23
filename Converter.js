@@ -111,16 +111,35 @@ function formatDuration(sec) {
     return h + "h " + remM + "m";
 }
 
-// Resolves a guaranteed non-existing output path before invoking any tool
-var UNIQUE_OUT_HELPER =
+// Checks both .tif and .tiff when target is TIFF so Poppler's .tif never collides,
+// and provides atomic_save() via hardlink (ln) + unlink so concurrent saves never overwrite or silently skip.
+var SAFE_IO_HELPERS =
+    "stem_free() { " +
+    "  local stem=\"$1\" ext=\"$2\"; " +
+    "  [ -e \"${stem}.${ext}\" ] && return 1; " +
+    "  if [ \"$ext\" = \"tiff\" ] || [ \"$ext\" = \"tif\" ]; then " +
+    "    [ -e \"${stem}.tif\" ] && return 1; " +
+    "    [ -e \"${stem}.tiff\" ] && return 1; " +
+    "  fi; " +
+    "  return 0; " +
+    "}; " +
     "unique_out() { " +
-    "  local base=\"$1\" ext=\"$2\" cand=\"${1}_converted.${2}\" n=1; " +
-    "  while [ -e \"$cand\" ]; do cand=\"${base}_converted_${n}.${ext}\"; n=$((n + 1)); done; " +
-    "  printf '%s' \"$cand\"; " +
+    "  local base=\"$1\" ext=\"$2\" stem=\"${1}_converted\" n=1; " +
+    "  while ! stem_free \"$stem\" \"$ext\"; do stem=\"${base}_converted_${n}\"; n=$((n + 1)); done; " +
+    "  printf '%s.%s' \"$stem\" \"$ext\"; " +
+    "}; " +
+    "atomic_save() { " +
+    "  local src=\"$1\" base=\"$2\" ext=\"$3\" cand; " +
+    "  [ -s \"$src\" ] || return 1; " +
+    "  while :; do " +
+    "    cand=$(unique_out \"$base\" \"$ext\"); " +
+    "    if ln \"$src\" \"$cand\" 2>/dev/null; then rm -f \"$src\"; printf '%s' \"$cand\"; return 0; fi; " +
+    "    [ -e \"$cand\" ] || { mv -- \"$src\" \"$cand\" && printf '%s' \"$cand\" && return 0; return 1; }; " +
+    "  done; " +
     "}; ";
 
 function wrapSafeCommand(basePath, dstExt, bodyScript, args) {
-    var script = UNIQUE_OUT_HELPER + "OUT=$(unique_out \"$1\" \"$2\"); " + bodyScript;
+    var script = SAFE_IO_HELPERS + "OUT=$(unique_out \"$1\" \"$2\"); " + bodyScript;
     return ["bash", "-c", script, "bash", basePath, dstExt].concat(args);
 }
 
@@ -186,7 +205,7 @@ function buildSofficeCmd(inputPath, basePath, dstExt, inFilter) {
             "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
             "soffice --headless " + filterArg + "--convert-to \"$2\" --outdir \"$TMPD\" \"$3\" >/dev/null && " +
             "GEN=$(find \"$TMPD\" -maxdepth 1 -type f | head -n 1) && [ -n \"$GEN\" ] && " +
-            "mv -n \"$GEN\" \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+            "FINAL=$(atomic_save \"$GEN\" \"$1\" \"$2\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
             [inputPath]
         )
     };
@@ -221,22 +240,24 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                     "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
                     "soffice --headless --infilter=writer_pdf_import --convert-to html --outdir \"$TMPD\" \"$3\" >/dev/null && " +
                     "HTMLF=$(find \"$TMPD\" -maxdepth 1 -type f -name '*.html' | head -n 1) && [ -n \"$HTMLF\" ] && " +
-                    "pandoc --sandbox \"$HTMLF\" -t gfm -o \"$OUT\" && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                    "pandoc --sandbox \"$HTMLF\" -t gfm -o \"$TMPD/out.md\" && " +
+                    "FINAL=$(atomic_save \"$TMPD/out.md\" \"$1\" \"$2\") && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                     [inputPath]
                 )
             };
         }
         if (["png", "jpg", "webp", "tiff"].indexOf(dstExt) !== -1) {
+            // pdftoppm -tiff writes <stem>.tif; canonicalize effective extension to "tif"
+            var effectiveImgExt = (dstExt === "tiff") ? "tif" : dstExt;
             var ppmFlag = (dstExt === "jpg") ? "jpeg" : dstExt;
             return {
                 engine: "pdftoppm",
                 accel: "CPU",
-                outPath: defaultOutPath,
+                outPath: basePath + "_converted." + effectiveImgExt,
                 cmd: wrapSafeCommand(
                     basePath,
-                    dstExt,
-                    "if command -v pdftoppm >/dev/null 2>&1; then " +
-                    "  pdftoppm -" + ppmFlag + " -r 150 -singlefile \"$3\" \"${OUT%.*}\" 2>/dev/null || magick -density 150 \"$3\" \"$OUT\"; " +
+                    effectiveImgExt,
+                    "if command -v pdftoppm >/dev/null 2>&1 && pdftoppm -" + ppmFlag + " -r 150 -singlefile \"$3\" \"${OUT%.*}\" 2>/dev/null; then :; " +
                     "else magick -density 150 \"$3\" \"$OUT\"; fi && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
                     [inputPath]
                 )
@@ -363,12 +384,12 @@ function buildCommand(inputPath, targetExt, hwAccel) {
                 dstExt,
                 "TMPD=$(mktemp -d) || exit 1; trap 'rm -rf \"$TMPD\"' EXIT; " +
                 "if pandoc --sandbox \"$3\" -o \"$TMPD/out.pdf\" 2>/dev/null; then " +
-                "  mv -n \"$TMPD/out.pdf\" \"$OUT\"; " +
+                "  FINAL=$(atomic_save \"$TMPD/out.pdf\" \"$1\" \"$2\"); " +
                 "else " +
                 "  pandoc --sandbox \"$3\" -o \"$TMPD/doc.html\" && " +
                 "  soffice --headless --convert-to pdf --outdir \"$TMPD\" \"$TMPD/doc.html\" >/dev/null && " +
-                "  mv -n \"$TMPD/doc.pdf\" \"$OUT\"; " +
-                "fi && printf '\\n__OUT_PATH__=%s\\n' \"$OUT\"",
+                "  FINAL=$(atomic_save \"$TMPD/doc.pdf\" \"$1\" \"$2\"); " +
+                "fi && [ -n \"$FINAL\" ] && printf '\\n__OUT_PATH__=%s\\n' \"$FINAL\"",
                 [inputPath]
             )
         };

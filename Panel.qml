@@ -148,10 +148,10 @@ Panel {
         progressRatio = 0.04
         statusLine = "CONVERTING · ~" + Conv.formatDuration(etaRemainingSec).toUpperCase() + " LEFT"
 
-        // Snapshot job inputs so changing selection mid-run never deletes the wrong source
+        // Snapshot job inputs and clear outPath until __OUT_PATH__ is emitted
         convertProc.jobSourcePath = selectedFile
         convertProc.jobKeepOriginal = keepOriginal
-        convertProc.outPath = plan.outPath
+        convertProc.outPath = ""
         convertProc.command = plan.cmd
         convertProc.running = true
     }
@@ -345,12 +345,12 @@ Panel {
             var totalTook = ((Date.now() - root.startTimeMs) / 1000.0).toFixed(1)
             root.converting = false
             root.etaRemainingSec = -1
-            if (exitCode === 0) {
+            if (exitCode === 0 && outPath !== "") {
                 root.progressRatio = 1.0
                 root.lastOutputPath = outPath
                 root.statusLine = "DONE IN " + totalTook + "S"
                 if (!jobKeepOriginal && jobSourcePath !== "" && jobSourcePath !== outPath) {
-                    Util.execArgv(["rm", "-f", jobSourcePath])
+                    Util.execArgv(["bash", "-c", "[ -s \"$1\" ] && rm -f -- \"$2\"", "bash", outPath, jobSourcePath])
                 }
             } else {
                 root.progressRatio = 0
